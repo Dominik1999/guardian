@@ -20,6 +20,8 @@ pub(crate) const DEFAULT_FILESYSTEM_AGGREGATE_THRESHOLD: usize = 1_000;
 /// Default deployment environment identifier exposed on
 /// `GET /dashboard/info`.
 pub(crate) const DEFAULT_ENVIRONMENT: &str = "testnet";
+/// Default network identifier exposed on `GET /status`.
+pub(crate) const DEFAULT_NETWORK: &str = "MidenTestnet";
 
 #[derive(Clone, Debug)]
 pub struct DashboardConfig {
@@ -31,6 +33,9 @@ pub struct DashboardConfig {
     pub(crate) commitment_rate_limit: RateLimitConfig,
     pub(crate) filesystem_aggregate_threshold: usize,
     pub(crate) environment: String,
+    /// Network identifier (`NetworkType` Display, e.g. `"MidenDevnet"`)
+    /// exposed unauthenticated on `GET /status`.
+    pub(crate) network: String,
     /// Optional pre-parsed HMAC secret for the dashboard cursor codec.
     /// When `None`, [`DashboardState`] generates a fresh random secret
     /// per process — fine for single-replica deployments and unit
@@ -55,6 +60,7 @@ impl DashboardConfig {
             })?;
         Ok(Self {
             environment: environment_for_network(network_type).to_string(),
+            network: network_type.to_string(),
             cursor_secret,
             ..Self::default()
         })
@@ -70,6 +76,10 @@ impl DashboardConfig {
 
     pub(crate) fn environment(&self) -> &str {
         &self.environment
+    }
+
+    pub(crate) fn network(&self) -> &str {
+        &self.network
     }
 
     pub(crate) fn take_cursor_secret(&mut self) -> Option<CursorSecret> {
@@ -100,6 +110,7 @@ impl Default for DashboardConfig {
             },
             filesystem_aggregate_threshold: DEFAULT_FILESYSTEM_AGGREGATE_THRESHOLD,
             environment: DEFAULT_ENVIRONMENT.to_string(),
+            network: DEFAULT_NETWORK.to_string(),
             cursor_secret: None,
         }
     }
@@ -224,5 +235,33 @@ mod tests {
                 .environment(),
             "local"
         );
+    }
+
+    #[test]
+    fn network_is_derived_from_network_type() {
+        let _cursor = EnvVarGuard::remove("GUARDIAN_DASHBOARD_CURSOR_SECRET");
+        assert_eq!(
+            DashboardConfig::from_env_for_network(NetworkType::MidenTestnet)
+                .unwrap()
+                .network(),
+            "MidenTestnet"
+        );
+        assert_eq!(
+            DashboardConfig::from_env_for_network(NetworkType::MidenDevnet)
+                .unwrap()
+                .network(),
+            "MidenDevnet"
+        );
+        assert_eq!(
+            DashboardConfig::from_env_for_network(NetworkType::MidenLocal)
+                .unwrap()
+                .network(),
+            "MidenLocal"
+        );
+    }
+
+    #[test]
+    fn for_tests_default_network_is_testnet() {
+        assert_eq!(DashboardConfig::for_tests().network(), "MidenTestnet");
     }
 }

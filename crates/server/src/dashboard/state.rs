@@ -414,6 +414,11 @@ impl DashboardState {
         self.config.environment()
     }
 
+    /// Network identifier surfaced unauthenticated on `GET /status`.
+    pub fn network(&self) -> &str {
+        self.config.network()
+    }
+
     /// Wall-clock time the dashboard state (and effectively the process)
     /// was initialized. Surfaced on `GET /dashboard/info` to identify
     /// the running binary instance.
