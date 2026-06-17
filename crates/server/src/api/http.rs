@@ -368,6 +368,26 @@ pub struct PubkeyQuery {
     pub scheme: Option<String>,
 }
 
+/// Public, unauthenticated liveness + identity probe. Returns the
+/// server's version, git commit, network, start time, and uptime.
+/// Consumed by wallet clients (pre-auth health check) and the status
+/// homepage. Exposes no account, operator, or auth data.
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "client",
+    responses(
+        (status = 200, description = "Server liveness, version, and network", body = crate::services::StatusResponse),
+    )
+)]
+pub async fn status(State(state): State<AppState>) -> Json<crate::services::StatusResponse> {
+    Json(crate::services::build_status(
+        state.dashboard.network(),
+        state.dashboard.started_at(),
+        state.clock.now(),
+    ))
+}
+
 /// Return the Guardian acknowledgement (ACK) public key / commitment
 /// for the requested signature scheme (`falcon` default, or `ecdsa`).
 #[utoipa::path(
