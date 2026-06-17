@@ -1,0 +1,14 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th,
+td {
+  border: 1px solid #ddd;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
