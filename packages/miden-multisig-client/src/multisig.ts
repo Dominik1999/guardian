@@ -15,6 +15,7 @@ import type {
   ProposalMetadata,
   ProposalSignatureEntry,
   ProposalType,
+  SignerSpec,
 } from './types.js';
 import { BoundBlockMismatchError, ProposalSaltMalformedError } from './multisig/authArgErrors.js';
 import type { ProcedureName } from './procedures.js';
@@ -57,6 +58,7 @@ import {
 import { buildConsumeNotesTransactionRequestFromNotes } from './transaction/consumeNotes.js';
 import type { MultisigRequestOptions } from './transaction/options.js';
 import { validateMultisigConfig } from './account/builder.js';
+import { resolveSignerSpecs, SignerSchemeMismatchError } from './account/signers.js';
 import { ensureNotesAuthenticated } from './transaction/noteAuthentication.js';
 import {
   CONSUME_NOTES_METADATA_VERSION_V2,
@@ -332,6 +334,8 @@ export class Multisig {
   account: Account;
   threshold: number;
   signerCommitments: string[];
+  /** The approvers with their registered schemes, index-aligned with `signerCommitments`. */
+  signers: SignerSpec[];
   guardianCommitment: string;
   procedureThresholds: Map<ProcedureName, number>;
   guardianPublicKey?: string;
@@ -376,7 +380,8 @@ export class Multisig {
   ) {
     this.account = account;
     this.threshold = config.threshold;
-    this.signerCommitments = config.signerCommitments;
+    this.signers = resolveSignerSpecs(config);
+    this.signerCommitments = this.signers.map((signer) => signer.commitment);
     this.guardianCommitment = config.guardianCommitment;
     this.guardianPublicKey = config.guardianPublicKey;
     this.procedureThresholds = new Map(
@@ -632,6 +637,19 @@ export class Multisig {
     };
   }
 
+  /**
+   * Refuses to act when an approver's registered scheme differs from this
+   * signer's. Rewriting the approver set (or registering with GUARDIAN, which
+   * binds one scheme per account) under this signer's scheme would otherwise
+   * silently change the other approvers' schemes.
+   */
+  private assertSignerSchemesMatch(): void {
+    const mismatched = this.signers.filter((signer) => signer.scheme !== this.signer.scheme);
+    if (mismatched.length > 0) {
+      throw new SignerSchemeMismatchError(this.signer.scheme, mismatched);
+    }
+  }
+
   private warnOnOverrideDilution(newNumSigners: number): void {
     const current = this.signerCommitments.length;
     for (const { procedure, threshold } of this.overridesDilutedBySignerGrowth(newNumSigners)) {
@@ -858,6 +876,7 @@ export class Multisig {
       this.account = account;
       this.threshold = detected.threshold;
       this.signerCommitments = detected.signerCommitments;
+      this.signers = detected.signers;
       this.guardianCommitment = detected.guardianCommitment;
       this.procedureThresholds = new Map(detected.procedureThresholds);
     } catch (error) {
@@ -874,6 +893,7 @@ export class Multisig {
    * @param initialStateBase64 - Optional base64-encoded serialized Account.¡
    */
   async registerOnGuardian(initialStateBase64?: string): Promise<void> {
+    this.assertSignerSchemesMatch();
     // Serialize the account to bytes and base64-encode
     const stateData =
       initialStateBase64 ?? uint8ArrayToBase64(this.account.serialize());
@@ -1166,6 +1186,7 @@ export class Multisig {
     ...legacyArgs: never[]
   ): Promise<Proposal> {
     assertProposalOptionsBag('createAddSignerProposal', options, legacyArgs);
+    this.assertSignerSchemesMatch();
     const targetThreshold = options.newThreshold ?? this.threshold;
     const targetSignerCommitments = [...this.signerCommitments, newCommitment];
     // What `update_signers_and_threshold` rejects on-chain, and what the auth
@@ -1214,6 +1235,7 @@ export class Multisig {
     ...legacyArgs: never[]
   ): Promise<Proposal> {
     assertProposalOptionsBag('createRemoveSignerProposal', options, legacyArgs);
+    this.assertSignerSchemesMatch();
     const normalizedRemove = signerToRemove.toLowerCase();
     const targetSignerCommitments = this.signerCommitments.filter(
       (c) => c.toLowerCase() !== normalizedRemove
@@ -1268,6 +1290,7 @@ export class Multisig {
     options: CreateProposalOptions = {},
   ): Promise<Proposal> {
     assertProposalOptionsBag('createChangeThresholdProposal', options);
+    this.assertSignerSchemesMatch();
     if (newThreshold < 1 || newThreshold > this.signerCommitments.length) {
       throw new Error(
         `Invalid threshold ${newThreshold}. Must be between 1 and ${this.signerCommitments.length}`
@@ -3116,6 +3139,7 @@ export class Multisig {
       case 'add_signer':
       case 'remove_signer':
       case 'change_threshold': {
+        this.assertSignerSchemesMatch();
         const { request } = await buildUpdateSignersTransactionRequest(
           this.midenClient,
           metadata.targetThreshold,

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { isProposalActionable, type Proposal } from './types/proposal.js';
 import { Multisig } from './multisig.js';
+import { SignerSchemeMismatchError } from './account/signers.js';
 import { GuardianHttpClient, type Signer } from '@openzeppelin/guardian-client';
 import { BoundBlockMismatchError } from './multisig/authArgErrors.js';
 import {
@@ -241,13 +242,27 @@ vi.mock('./utils/encoding.js', async () => {
 });
 
 // Keep the real assertCompleteDetectedConfig so refreshConfigFromAccount's
-// fail-closed validation is exercised.
+// fail-closed validation is exercised. Fixtures that do not spell out
+// `signers` read every approver (and the guardian) as Falcon.
 vi.mock('./inspector.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./inspector.js')>();
   return {
     ...actual,
     AccountInspector: {
-      fromAccount: mockDetectConfig,
+      fromAccount: (account: unknown) => {
+        const detected = mockDetectConfig(account);
+        if (!detected || detected.signers) {
+          return detected;
+        }
+        return {
+          ...detected,
+          signers: detected.signerCommitments.map((commitment: string) => ({
+            commitment,
+            scheme: 'falcon',
+          })),
+          guardianScheme: detected.guardianScheme ?? 'falcon',
+        };
+      },
       getSignerPublicKeyCommitments: mockGetSignerCommitments,
       getGuardianPublicKeyCommitment: mockGetGuardianCommitment,
     },
@@ -1496,6 +1511,7 @@ describe('Multisig', () => {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const ecdsaSigner: Signer = {
@@ -3564,6 +3580,72 @@ describe('Multisig', () => {
     });
   });
 
+  describe('per-approver signature schemes', () => {
+    const mixedConfig = {
+      threshold: 1,
+      signerCommitments: [
+        '0x' + 'a'.repeat(64),
+        { commitment: '0x' + 'b'.repeat(64), scheme: 'ecdsa' as const },
+      ],
+      guardianCommitment: '0x' + 'c'.repeat(64),
+    };
+
+    it('exposes each approver with its scheme next to the bare commitments', () => {
+      const multisig = createTestMultisig(mixedConfig);
+
+      expect(multisig.signerCommitments).toEqual(['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)]);
+      expect(multisig.signers).toEqual([
+        { commitment: '0x' + 'a'.repeat(64), scheme: 'falcon' },
+        { commitment: '0x' + 'b'.repeat(64), scheme: 'ecdsa' },
+      ]);
+    });
+
+    it('refuses to register a mixed-scheme account on GUARDIAN', async () => {
+      const multisig = createTestMultisig(mixedConfig);
+
+      const error = await multisig.registerOnGuardian().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(SignerSchemeMismatchError);
+      expect(error).toMatchObject({
+        code: 'signer_scheme_mismatch',
+        signerScheme: 'falcon',
+        mismatched: [{ commitment: '0x' + 'b'.repeat(64), scheme: 'ecdsa' }],
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('refuses to rewrite a mixed-scheme approver set under the proposer scheme', async () => {
+      const multisig = createTestMultisig({ ...mixedConfig, threshold: 2 });
+
+      await expect(multisig.createChangeThresholdProposal(1)).rejects.toBeInstanceOf(
+        SignerSchemeMismatchError,
+      );
+      await expect(
+        multisig.createAddSignerProposal('0x' + 'd'.repeat(64)),
+      ).rejects.toBeInstanceOf(SignerSchemeMismatchError);
+      await expect(
+        multisig.createRemoveSignerProposal('0x' + 'b'.repeat(64)),
+      ).rejects.toBeInstanceOf(SignerSchemeMismatchError);
+      expect(buildUpdateSignersTransactionRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses an acting signer whose scheme differs from its registered scheme', async () => {
+      const multisig = createTestMultisig(
+        {
+          threshold: 1,
+          signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+          guardianCommitment: '0x' + 'c'.repeat(64),
+          signatureScheme: 'ecdsa' as const,
+        },
+        mockSigner,
+      );
+
+      await expect(multisig.createChangeThresholdProposal(2)).rejects.toThrow(
+        /signer scheme 'falcon' does not match the registered scheme/,
+      );
+    });
+  });
+
   describe('createChangeThresholdProposal', () => {
     it('passes the signer scheme to update-signers requests', async () => {
       const ecdsaSigner: Signer = {
@@ -3577,6 +3659,7 @@ describe('Multisig', () => {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const mockDelta = {
@@ -3959,6 +4042,7 @@ describe('Multisig', () => {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const multisig = createTestMultisig(config, ecdsaSigner);
@@ -4343,6 +4427,7 @@ describe('Multisig', () => {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const multisig = createTestMultisig(config, ecdsaSigner);
@@ -4997,6 +5082,7 @@ describe('Multisig', () => {
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
         guardianPublicKey: '0x' + '1'.repeat(66),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const ecdsaSigner: Signer = {
@@ -5141,6 +5227,7 @@ describe('Multisig', () => {
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
         guardianPublicKey: '0x' + '1'.repeat(66),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const ecdsaSigner: Signer = {
@@ -6060,6 +6147,7 @@ describe('Multisig', () => {
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
         guardianPublicKey: '0x' + '1'.repeat(66),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const ecdsaSigner: Signer = {
@@ -6213,6 +6301,7 @@ describe('Multisig', () => {
         signerCommitments: ['0x' + 'a'.repeat(64)],
         guardianCommitment: '0x' + 'c'.repeat(64),
         guardianPublicKey: '0x' + '1'.repeat(66),
+        signatureScheme: 'ecdsa' as const,
       };
 
       const ecdsaSigner: Signer = {
