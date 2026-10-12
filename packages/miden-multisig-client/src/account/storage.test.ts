@@ -88,6 +88,20 @@ describe('buildMultisigStorageSlots', () => {
     expect(signerSchemesMap.entries).toHaveLength(2);
   });
 
+  it('hands Word.fromHex a 0x-prefixed approver commitment for an 0X input', async () => {
+    const { buildMultisigStorageSlots } = await import('./storage.js');
+
+    buildMultisigStorageSlots({
+      threshold: 1,
+      signerCommitments: [{ commitment: '0X' + '1'.repeat(64), scheme: 'ecdsa' }],
+      guardianCommitment: '0x' + '2'.repeat(64),
+    });
+
+    expect(storageMaps[0].entries.map((entry) => entry.value)).toEqual([
+      { data: '0x' + '1'.repeat(64) },
+    ]);
+  });
+
   it('writes each approver scheme id at its signer index for a mixed set', async () => {
     const { buildMultisigStorageSlots } = await import('./storage.js');
 
@@ -130,6 +144,20 @@ describe('buildMultisigStorageSlots', () => {
 describe('buildGuardianStorageSlots', () => {
   beforeEach(() => {
     storageMaps.length = 0;
+  });
+
+  it('hands Word.fromHex a 0x-prefixed guardian commitment for an 0X input', async () => {
+    const { buildGuardianStorageSlots } = await import('./storage.js');
+
+    buildGuardianStorageSlots({
+      threshold: 1,
+      signerCommitments: [{ commitment: '0x' + '1'.repeat(64), scheme: 'ecdsa' }],
+      guardianCommitment: '0X' + '2'.repeat(64),
+    });
+
+    expect(storageMaps[0].entries.map((entry) => entry.value)).toEqual([
+      { data: '0x' + '2'.repeat(64) },
+    ]);
   });
 
   it('writes the configured signatureScheme for the guardian, independent of approver specs', async () => {

@@ -44,7 +44,10 @@ export interface DetectedMultisigConfig {
  */
 export function assertCompleteDetectedConfig(
   detected: DetectedMultisigConfig,
-): asserts detected is DetectedMultisigConfig & { guardianCommitment: string } {
+): asserts detected is DetectedMultisigConfig & {
+  guardianCommitment: string;
+  guardianScheme: SignatureScheme;
+} {
   if (detected.numSigners === 0 || detected.signerCommitments.length !== detected.numSigners) {
     throw new Error(
       `incomplete signer set: storage reports ${detected.numSigners} signers, read ${detected.signerCommitments.length}`,
@@ -58,6 +61,12 @@ export function assertCompleteDetectedConfig(
   if (!detected.guardianCommitment) {
     throw new Error(
       'missing guardian commitment: the guarded-multisig always includes a guardian',
+    );
+  }
+  if (!detected.guardianScheme) {
+    throw new Error(
+      'missing guardian scheme: the guardian scheme could not be read, and adopting a ' +
+        'default could register the account with GUARDIAN under a scheme it does not verify',
     );
   }
 }

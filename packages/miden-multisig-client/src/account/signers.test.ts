@@ -32,6 +32,17 @@ describe('resolveSignerSpecs', () => {
     ]);
   });
 
+  it('normalizes an uppercase or missing 0x prefix on bare and spec commitments', () => {
+    expect(
+      resolveSignerSpecs({
+        signerCommitments: ['0X' + 'a'.repeat(64), { commitment: 'b'.repeat(64), scheme: 'ecdsa' }],
+      }),
+    ).toEqual([
+      { commitment: A, scheme: 'falcon' },
+      { commitment: B, scheme: 'ecdsa' },
+    ]);
+  });
+
   it('rejects an unknown approver scheme', () => {
     expect(() =>
       resolveSignerSpecs({

@@ -1,8 +1,7 @@
 import type { MultisigConfig, SignatureScheme } from '../types.js';
 import { StorageSlot, StorageMap, Word } from '@miden-sdk/miden-sdk';
-import { ensureHexPrefix } from '../utils/encoding.js';
 import { getProcedureRoot } from '../procedures.js';
-import { authSchemeId } from '../utils/signature.js';
+import { authSchemeId, normalizeSignerCommitment } from '../utils/signature.js';
 import { MULTISIG_SLOT_NAMES, GUARDIAN_SLOT_NAMES } from './layout.js';
 import { DEFAULT_SIGNATURE_SCHEME, resolveSignerSpecs } from './signers.js';
 
@@ -31,7 +30,7 @@ export class StorageLayoutBuilder {
     const signersMap = new StorageMap();
     signers.forEach(({ commitment }, index) => {
       const key = signerMapKey(BigInt(index));
-      const value = Word.fromHex(ensureHexPrefix(commitment));
+      const value = Word.fromHex(normalizeSignerCommitment(commitment));
       signersMap.insert(key, value);
     });
     const slot1 = StorageSlot.map(MULTISIG_SLOT_NAMES.SIGNER_PUBLIC_KEYS, signersMap);
@@ -68,7 +67,7 @@ export class StorageLayoutBuilder {
     const zeroKey = signerMapKey(0n);
 
     const guardianKeyMap = new StorageMap();
-    const guardianKey = Word.fromHex(ensureHexPrefix(config.guardianCommitment));
+    const guardianKey = Word.fromHex(normalizeSignerCommitment(config.guardianCommitment));
     guardianKeyMap.insert(zeroKey, guardianKey);
     const slot0 = StorageSlot.map(GUARDIAN_SLOT_NAMES.PUBLIC_KEY, guardianKeyMap);
 

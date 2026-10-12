@@ -3600,6 +3600,68 @@ describe('Multisig', () => {
       ]);
     });
 
+    it('exposes the guardian scheme, defaulting to Falcon like the account builder', () => {
+      expect(createTestMultisig(mixedConfig).guardianScheme).toBe('falcon');
+      expect(
+        createTestMultisig({ ...mixedConfig, signatureScheme: 'ecdsa' as const }).guardianScheme,
+      ).toBe('ecdsa');
+    });
+
+    // All approvers ECDSA, `signatureScheme` omitted: the account builder wrote
+    // a Falcon guardian. An ECDSA signer matches every approver, so only the
+    // guardian can stop a registration that would make GUARDIAN sign ECDSA acks
+    // the account verifies as Falcon.
+    const falconGuardianConfig = {
+      threshold: 1,
+      signerCommitments: [
+        { commitment: '0x' + 'a'.repeat(64), scheme: 'ecdsa' as const },
+        { commitment: '0x' + 'b'.repeat(64), scheme: 'ecdsa' as const },
+      ],
+      guardianCommitment: '0x' + 'c'.repeat(64),
+    };
+    const ecdsaSigner: Signer = { ...mockSigner, publicKey: '0x' + '2'.repeat(66), scheme: 'ecdsa' };
+
+    it('refuses to register on GUARDIAN when the guardian scheme differs from the signer scheme', async () => {
+      guardian.setSigner(ecdsaSigner);
+      const multisig = createTestMultisig(falconGuardianConfig, ecdsaSigner);
+
+      const error = await multisig.registerOnGuardian().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(SignerSchemeMismatchError);
+      expect(error).toMatchObject({
+        code: 'signer_scheme_mismatch',
+        signerScheme: 'ecdsa',
+        mismatched: [],
+        guardian: { commitment: '0x' + 'c'.repeat(64), scheme: 'falcon' },
+      });
+      expect((error as Error).message).toMatch(/guardian/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('refuses a switch-guardian proposal when the guardian scheme differs from the signer scheme', async () => {
+      guardian.setSigner(ecdsaSigner);
+      const multisig = createTestMultisig(falconGuardianConfig, ecdsaSigner);
+
+      await expect(
+        multisig.createSwitchGuardianProposal('http://new-guardian:3000', '0x' + 'd'.repeat(64)),
+      ).rejects.toBeInstanceOf(SignerSchemeMismatchError);
+      await expect(
+        multisig.createSwitchGuardianProposalOffline('http://new-guardian:3000', '0x' + 'd'.repeat(64)),
+      ).rejects.toBeInstanceOf(SignerSchemeMismatchError);
+      expect(buildUpdateGuardianTransactionRequest).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('refuses signer updates when the guardian scheme differs from the signer scheme', async () => {
+      guardian.setSigner(ecdsaSigner);
+      const multisig = createTestMultisig({ ...falconGuardianConfig, threshold: 2 }, ecdsaSigner);
+
+      await expect(multisig.createChangeThresholdProposal(1)).rejects.toBeInstanceOf(
+        SignerSchemeMismatchError,
+      );
+      expect(buildUpdateSignersTransactionRequest).not.toHaveBeenCalled();
+    });
+
     it('refuses to register a mixed-scheme account on GUARDIAN', async () => {
       const multisig = createTestMultisig(mixedConfig);
 

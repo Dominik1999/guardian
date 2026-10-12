@@ -544,6 +544,15 @@ describe('assertCompleteDetectedConfig', () => {
     ).toThrow(/incomplete signer schemes: storage reports 2 signers, read 1 schemes/);
   });
 
+  it('rejects a guardian scheme that could not be read', () => {
+    expect(() =>
+      assertCompleteDetectedConfig({
+        ...complete,
+        guardianScheme: null,
+      }),
+    ).toThrow(/missing guardian scheme/);
+  });
+
   it('rejects a missing guardian commitment', () => {
     expect(() =>
       assertCompleteDetectedConfig({

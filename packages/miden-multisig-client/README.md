@@ -239,11 +239,15 @@ accept the same `string | SignerSpec` entries, and
 
 GUARDIAN currently binds one scheme to each account, so a mixed-scheme account
 cannot yet be registered or operated through it:
-`Multisig.registerOnGuardian()` and the add-signer, remove-signer and
-change-threshold proposals throw `SignerSchemeMismatchError`
-(`code: 'signer_scheme_mismatch'`) whenever an approver's registered scheme
-differs from the acting signer's, instead of rewriting the other approvers'
-schemes.
+`Multisig.registerOnGuardian()`, the add-signer, remove-signer and
+change-threshold proposals, and the switch-GUARDIAN proposals throw
+`SignerSchemeMismatchError` (`code: 'signer_scheme_mismatch'`) whenever an
+approver's registered scheme, or the guardian's (`Multisig.guardianScheme`),
+differs from the acting signer's, instead of rewriting the other schemes. The
+guardian check matters even for a single-scheme approver set: all-ECDSA
+`SignerSpec`s with `signatureScheme` omitted get a Falcon guardian, and
+registering that account under ECDSA would have GUARDIAN sign acknowledgements
+the account verifies as Falcon.
 
 ### Register on GUARDIAN
 

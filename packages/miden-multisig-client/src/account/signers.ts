@@ -28,9 +28,22 @@ export function allSignersUse(signers: readonly SignerSpec[], scheme: SignatureS
 
 function toSignerSpec(signer: SignerInput, defaultScheme: SignatureScheme): SignerSpec {
   if (typeof signer === 'string') {
-    return { commitment: signer, scheme: defaultScheme };
+    return { commitment: normalizeCommitmentPrefix(signer), scheme: defaultScheme };
   }
-  return { commitment: signer.commitment, scheme: assertSignatureScheme(signer.scheme) };
+  return {
+    commitment: normalizeCommitmentPrefix(signer.commitment),
+    scheme: assertSignatureScheme(signer.scheme),
+  };
+}
+
+/**
+ * Gives a commitment the `0x` prefix `Word.fromHex` accepts: an `0X` prefix is lowered and a
+ * missing one added. The digits are left as given.
+ */
+function normalizeCommitmentPrefix(commitment: string): string {
+  const digits =
+    commitment.startsWith('0x') || commitment.startsWith('0X') ? commitment.slice(2) : commitment;
+  return `0x${digits}`;
 }
 
 function assertSignatureScheme(scheme: SignatureScheme): SignatureScheme {
@@ -49,11 +62,14 @@ function assertSignatureScheme(scheme: SignatureScheme): SignatureScheme {
 export type SignerSchemeErrorCode = 'signer_scheme_mismatch';
 
 /**
- * The acting signer's scheme differs from a scheme registered for the account's approvers.
+ * The acting signer's scheme differs from a scheme registered for the account's approvers or
+ * its guardian.
  *
- * Raised before a transaction that rewrites the approver set (or registers the account with
- * GUARDIAN) is built, because building it under the acting signer's scheme would silently change
- * the other approvers' schemes, and GUARDIAN binds a single scheme to an account.
+ * Raised before a transaction that rewrites the approver set or the guardian (or registers the
+ * account with GUARDIAN) is built, because building it under the acting signer's scheme would
+ * silently change the other schemes, and GUARDIAN binds a single scheme to an account: a
+ * registration or guardian rotation under a scheme the account does not verify the guardian's
+ * acknowledgements with would leave every transaction failing on-chain.
  */
 export class SignerSchemeMismatchError extends Error {
   readonly code: SignerSchemeErrorCode = 'signer_scheme_mismatch';
@@ -61,11 +77,16 @@ export class SignerSchemeMismatchError extends Error {
   constructor(
     readonly signerScheme: SignatureScheme,
     readonly mismatched: SignerSpec[],
+    /** The guardian, when its registered scheme is the one that differs. */
+    readonly guardian?: SignerSpec,
   ) {
     super(
       `signer scheme '${signerScheme}' does not match the registered scheme of ` +
-        mismatched.map((signer) => `${signer.commitment} ('${signer.scheme}')`).join(', ') +
-        '; mixed-scheme approver sets cannot be operated through GUARDIAN yet',
+        [
+          ...mismatched.map((signer) => `${signer.commitment} ('${signer.scheme}')`),
+          ...(guardian ? [`the guardian ${guardian.commitment} ('${guardian.scheme}')`] : []),
+        ].join(', ') +
+        '; mixed-scheme accounts cannot be operated through GUARDIAN yet',
     );
     this.name = 'SignerSchemeMismatchError';
   }
