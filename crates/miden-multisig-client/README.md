@@ -103,7 +103,7 @@ use miden_multisig_client::StartSessionOptions;
 
 let info = client
     .start_session(StartSessionOptions {
-        network: "devnet".to_string(), // the Guardian's network: local, devnet or testnet
+        network: "devnet".to_string(), // the Guardian's /status environment: local, devnet, testnet, cedar or mainnet
         ttl: Duration::from_secs(3600), // more than 5 minutes, at most the Guardian's maximum
     })
     .await?;
@@ -170,8 +170,8 @@ re-sends undelivered notes on later syncs).
 ### Note transport endpoint (`note_transport_endpoint`)
 
 Private notes are relayed through a note transport service that is separate
-from the node RPC. The testnet and devnet presets derive the transport
-endpoint automatically; a custom node endpoint has no derivable transport
+from the node RPC. The devnet, testnet, Cedar (`MidenCedar::endpoint()`) and
+mainnet presets derive the transport endpoint automatically; a custom node endpoint has no derivable transport
 service, so private-note relay stays disabled until this is set explicitly.
 
 ```rust
@@ -188,8 +188,8 @@ let mut client = MultisigClient::builder()
 ### Remote prover (`prover_config`)
 
 `ProverConfig` overrides the remote prover endpoint and the proof retry
-policy. Without it, the devnet and testnet presets use their public provers
-and every other endpoint proves locally. A custom URL must be absolute
+policy. Without it, the devnet, testnet, Cedar and mainnet presets use their public
+provers and every other endpoint proves locally. A custom URL must be absolute
 HTTP(S) and never falls back to a default endpoint. Remote proving gets two
 total attempts by default and local proving is never retried; retries apply
 only to transient proof failures, so transaction execution, submission, local
@@ -560,10 +560,11 @@ local store) becomes a `RecoveryStepProblem` entry instead of aborting the
 flow, and `retryable: true` means rerunning the flow — which is idempotent —
 can plausibly recover more. In brief:
 
-- **Transport drain** — rescans the full private-note transport backlog for
-  every tracked tag, regardless of the stored cursor (and without ever
-  regressing it). Bounded by the transport service's retention: a
-  best-effort rescan, **not** a backup.
+- **Transport drain** — fetches the private-note transport backlog for
+  every tracked tag until a fetch moves no tag's cursor. A recovered account's
+  tag has no transport cursor yet, so its whole retained backlog is fetched.
+  Bounded by the transport service's retention: a best-effort rescan,
+  **not** a backup.
 - **Proposal import** — rebuilds importable notes from the bytes v2
   consume-notes proposals embed (validated against the proposals' declared
   note ids) plus node-fetched inclusion proofs, so it works for private

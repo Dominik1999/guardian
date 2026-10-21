@@ -172,6 +172,7 @@ pub struct ConfigureResponse {
         (status = 400, description = "Invalid request", body = crate::openapi::ApiErrorResponse),
         (status = 401, description = "Authentication failed or replay rejected", body = crate::openapi::ApiErrorResponse),
         (status = 403, description = "New account uses a signature scheme excluded by GUARDIAN_ALLOWED_ACCOUNT_SCHEMES (`signature_scheme_not_allowed`; meta.scheme and meta.allowed_schemes)", body = crate::openapi::ApiErrorResponse),
+        (status = 502, description = "Re-onboarding with a state older than the stored one, and the chain could not be read to check whether the stored state landed (`rpc_unavailable`)", body = crate::openapi::ApiErrorResponse),
     )
 )]
 pub async fn configure(
@@ -639,6 +640,8 @@ pub struct DeltaProposalResponse {
 #[derive(Deserialize, Serialize, utoipa::ToSchema, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PubkeyQuery {
+    /// `falcon` or `ecdsa`. Omitted or unrecognized values return the Falcon key, whichever
+    /// schemes the server admits for new accounts.
     pub scheme: Option<String>,
 }
 

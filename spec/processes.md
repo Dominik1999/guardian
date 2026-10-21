@@ -2,7 +2,7 @@
 
 ## Services overview
 
-- **configure_account**: creates a Miden account by validating the provided network configuration and auth policy, then storing account metadata and the initial state with its commitment and account nonce. Every entry in `auth.cosigner_commitments` must be a canonical commitment (`0x` plus 64 lowercase hex digits) and the list must be non-empty and duplicate-free. For MultisigGuardian accounts the list must exactly match the signer map extracted from `initial_state`, including the map's canonical (index) order — the stored list is the authorization source of truth for every later request, so any mismatch is rejected as `InvalidInput`. EVM accounts are not configured through this service.
+- **configure_account**: creates a Miden account by validating the provided network configuration and auth policy, then storing account metadata and the initial state with its commitment and account nonce. Every entry in `auth.cosigner_commitments` must be a canonical commitment (`0x` plus 64 lowercase hex digits) and the list must be non-empty and duplicate-free. For MultisigGuardian accounts the list must exactly match the signer map extracted from `initial_state`, including the map's canonical (index) order — the stored list is the authorization source of truth for every later request, so any mismatch is rejected as `InvalidInput`. A new account is first claimed by inserting its metadata row only if none exists; the request's replay timestamp is then consumed before any state is written, for new and existing accounts alike. Of two concurrent first configurations exactly one creates the account and the other is judged as a reconfiguration of it, so a retry or replay of the same signed request is refused with `authentication_replay` before it writes; one from a different signer passes its own replay check and reconfigures the account it lost to. A storage failure after the claim leaves metadata without stored state: the account is not listed by lookup and is skipped by the release sweep, and a retry of the same account id finishes it as a first configuration, held to the new-account scheme policy and counted as a creation. EVM accounts are not configured through this service.
 - **push_delta**: verifies a Miden delta against the tail of the account's candidate queue (the canonical state when nothing is queued, always so at the default depth of one), computes the new state's commitment and account nonce, attaches an acknowledgement, and either enqueues it as a candidate (canonicalization enabled) or immediately applies it and marks it canonical (optimistic mode). EVM accounts do not support `push_delta` in v1.
 - **get_state**: authenticates and returns the latest persisted account state.
 - **get_canonical_nonce**: authenticates and returns the account nonce and commitment stored with the latest persisted account state, without loading the state blob, so a client can skip `get_state` when that nonce is below its local nonce, or equal to it at the same commitment (issue #191). A state stored before nonces were kept is decoded once, and its nonce is backfilled onto the row only while the row still holds that state.
@@ -33,14 +33,25 @@ sequenceDiagram
   S->>S: reject unless auth.cosigner_commitments == extracted signer map\n(exact set and order)
   S->>S: auth.verify(account_id, timestamp, request_payload_digest, credential)
   S->>N: get_state_head(account_id, initial_state)\n(commitment, nonce)
-  alt existing account
-    S->>M: update last_auth_timestamp (verified signer, CAS)
+  alt no metadata for account_id
+    S->>M: create(account_id, auth, network_config, timestamps)\n(insert only if absent)
+    alt claim lost to a concurrent first configuration
+      S->>M: get(account_id)\n(judged as a reconfiguration from here)
+    end
   end
-  S->>ST: submit_state(state_json, commitment, nonce)
-  S->>M: set(account_id, auth, network_config, timestamps)
-  alt first-time account
-    Note over S,M: metadata must exist first because replay state references it by FK
-    S->>M: seed last_auth_timestamp (verified signer, CAS)
+  Note over S,M: the claim guarantees the metadata row that replay state references by FK
+  S->>M: update last_auth_timestamp (verified signer, CAS)\n(refused: authentication_replay, nothing written)
+  Note over S,M: before any stored-state or chain read below, so a replayed request never drives the history search
+  alt existing account, submitted nonce below the stored one (decoded from the stored state when its row has none)
+    S->>N: verify_commitment / find_transaction_ending_at(stored commitment)
+    Note over S,N: the chain reached the stored state: 400 commitment_mismatch (a stale state); the chain cannot be read: rpc_unavailable (fail closed)
+  end
+  alt existing account
+    S->>ST: replace_state(state_json, commitment, nonce)\nonly while the stored commitment is the one read after the replay floor
+    Note over S,ST: a state promoted meanwhile is never overwritten: 400 commitment_mismatch (expected = the stored commitment)
+    S->>M: set(account_id, auth, network_config, timestamps)
+  else first-time account
+    S->>ST: submit_state(state_json, commitment, nonce)
   end
   S-->>C: 200 {account_id, ack_pubkey, ack_commitment}
 ```
@@ -77,8 +88,7 @@ sequenceDiagram
       alt the tail binds another signer set or guardian key
         S-->>C: 409 ConflictPendingDelta
       end
-      S->>N: verify_delta(tail_commitment, tail_state, payload)
-      S->>N: apply_delta(tail_state, payload)\n(new_state_json, new_commitment, new_nonce)
+      S->>N: verify_and_apply_delta(tail_commitment, tail_state, payload)\n(one decode: new_state_json, new_commitment, new_nonce)
       alt a candidate is queued and new_nonce is not the delta's nonce
         S-->>C: 409 ConflictPendingDelta
       end
@@ -373,7 +383,7 @@ sequenceDiagram
   admitted: while the queue is full, when a queue exists and their nonce
   is not the tail's plus one, or behind a tail that changes the signer set
   or guardian key. Both SDKs label a proposal with the account's next
-  nonce (the TypeScript SDK since the release after 0.18.0; earlier
+  nonce (the TypeScript SDK since 0.18.1; earlier
   releases used a timestamp, which the rule refuses), so a proposal built
   on the tail carries the tail's nonce plus one, and one built on the
   canonical state (all `/state` serves) carries the tail's nonce or less:
@@ -419,7 +429,8 @@ sequenceDiagram
       their own turn as the stored base advances along the chain.
     - Matches the expected new commitment: canonicalize —
       persist new state (atomic with delta status update when possible),
-      optionally update auth from chain via `should_update_auth`, set delta
+      optionally update auth from the cosigner commitments `apply_delta`
+      read off the new state, set delta
       status to `canonical`, and delete the matching Miden delta proposal
       identified via `delta_proposal_id(account_id, nonce, delta_payload)`.
       The persisted commitment is the recomputed one the verification
@@ -549,9 +560,8 @@ sequenceDiagram
       W->>N: verify_commitment(account_id, stored new_commitment)
       alt claim matches on-chain
         W->>ST: pull_state(account_id)
-        W->>N: apply_delta(prev_state, delta)\n(new_state, recomputed_commitment, nonce)
+        W->>N: apply_delta(prev_state, delta)\n(new_state, recomputed_commitment, nonce, auth bindings)
         alt recomputed commitment equals stored claim
-          W->>N: should_update_auth(new_state)
           W->>ST: promote_candidate(new_state, canonical delta, new_auth?)\n(lease-fenced write)
         else reconstruction differs
           W->>W: leave candidate for full pass
@@ -561,10 +571,9 @@ sequenceDiagram
       end
     else full pass
       W->>ST: pull_state(account_id)
-      W->>N: apply_delta(prev_state, delta)\n(new_state, expected_commitment, nonce)
+      W->>N: apply_delta(prev_state, delta)\n(new_state, expected_commitment, nonce, auth bindings)
       W->>N: verify_commitment(account_id, expected_commitment)
       alt on-chain matches expected commitment
-        W->>N: should_update_auth(new_state)\n(maybe new cosigner keys)
         W->>ST: promote_candidate(new_state, canonical delta, new_auth?)\n(one lease-fenced write: state + delta status + auth + flag)
         ST-->>W: applied | stale_base | not_candidate | stale_lease\n(rejections leave no partial write)
       else on-chain still at prev_commitment (not landed)
@@ -656,22 +665,25 @@ so the sweep is deliberately slow and rate-bounded.
      released: when the chain holds the stored state the account is
      reported as `own_key_mismatch`; when it moved on, the detectors
      below decide.
-  3. **Chain moved past the stored base: candidate match.** Every
-     pending proposal and every recoverable delta (`retained`, or
-     `discarded { client_abandoned }` within `retained_ttl_seconds`)
-     that chains from the stored base is applied to the stored state
-     (the same `apply_delta` canonicalization uses; computed once per
-     candidate and base, failures included). A proposal counts whatever
-     its label (the post-state's guardian key decides, not the
-     client-written type) and whatever base it was recorded against: the
-     candidate queue records a proposal against its tail. One built on
-     the stored state behind a queued candidate is refused unless its
-     nonce is the tail's plus one, but a summary does not name its base,
-     so one labelled exactly so is recorded against the tail all the
-     same.
-     A switch delta queued behind another candidate and parked with
-     it does not chain from the stored base and is not matched yet
-     (issue #504). The
+  3. **Chain moved past the stored base: candidate match.** The
+     candidates are every pending proposal and every recoverable delta
+     (`retained`, or `discarded { client_abandoned }` within
+     `retained_ttl_seconds`) that chains from the stored base, directly
+     or through other recoverable deltas. Their bases are the stored
+     state and the end state of every recoverable delta chaining from
+     it, each replayed with the same `apply_delta` canonicalization uses
+     and required to reproduce the commitment the delta was admitted
+     with: a switch delta parked behind another candidate (issue #504)
+     starts from its predecessor's end state, and a proposal built on a
+     state a retained delta reached by landing late starts from that
+     delta's. A recoverable delta is applied to the base it was admitted
+     on; a summary does not name its base, so a proposal is applied to
+     every base (post-states computed once per candidate and base,
+     failures included). A proposal counts whatever its label (the
+     post-state's guardian key decides, not the client-written type) and
+     whatever base it was recorded against: the candidate queue records
+     a proposal against its tail, and with an empty queue against the
+     stored state. The
      resulting commitment is looked for on chain: first at the head
      (free: the probe already read it), then — for post-states that move
      the guardian key away — in the account's transaction history
