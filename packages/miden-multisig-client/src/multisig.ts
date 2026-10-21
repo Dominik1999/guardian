@@ -1491,7 +1491,6 @@ export class Multisig {
     options: CreateProposalOptions = {},
   ): Promise<ExportedProposal> {
     assertProposalOptionsBag('createSwitchGuardianProposalOffline', options);
-    this.assertSignerSchemesMatch();
 
     // Sync with the Miden node and refresh the cached account/config before
     // building (mirrors the Rust `sync_network_only`): with no GUARDIAN push
@@ -1499,6 +1498,9 @@ export class Multisig {
     // state — or a readiness threshold read from stale config — would only
     // fail at execution, after the whole side-channel cosigning ceremony.
     const synced = await this.syncNetworkOnly();
+    // After the refresh, so the schemes checked are the ones the summary is
+    // built against.
+    this.assertSignerSchemesMatch();
     const proposalNonce = await this.resolveProposalNonce(
       'createSwitchGuardianProposalOffline',
       options,

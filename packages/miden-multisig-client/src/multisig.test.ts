@@ -3652,6 +3652,44 @@ describe('Multisig', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it('checks an offline switch-guardian proposal against the config the node sync refreshed', async () => {
+      // The cached config is uniform Falcon, but the account the sync reads
+      // back has an ECDSA guardian (rotated by another client): the check has
+      // to see the refreshed guardian, not the stale one.
+      const multisig = createTestMultisig({
+        threshold: 1,
+        signerCommitments: [mockSigner.commitment],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      });
+      mockDetectConfig.mockReturnValue({
+        threshold: 1,
+        numSigners: 1,
+        signerCommitments: [mockSigner.commitment],
+        signers: [{ commitment: mockSigner.commitment, scheme: 'falcon' }],
+        guardianCommitment: '0x' + 'e'.repeat(64),
+        guardianScheme: 'ecdsa',
+        vaultBalances: [],
+        procedureThresholds: new Map(),
+      });
+      mockWebClient.accounts.get.mockResolvedValue({
+        ...mockAccount,
+        ...mockedAccount(LOCAL_ACCOUNT_COMMITMENT, 1),
+      });
+
+      const error = await multisig
+        .createSwitchGuardianProposalOffline('http://new-guardian:3000', '0x' + 'd'.repeat(64))
+        .catch((e: unknown) => e);
+
+      expect(mockWebClient.syncChain).toHaveBeenCalled();
+      expect(error).toBeInstanceOf(SignerSchemeMismatchError);
+      expect(error).toMatchObject({
+        signerScheme: 'falcon',
+        mismatched: [],
+        guardian: { commitment: '0x' + 'e'.repeat(64), scheme: 'ecdsa' },
+      });
+      expect(buildUpdateGuardianTransactionRequest).not.toHaveBeenCalled();
+    });
+
     it('refuses signer updates when the guardian scheme differs from the signer scheme', async () => {
       guardian.setSigner(ecdsaSigner);
       const multisig = createTestMultisig({ ...falconGuardianConfig, threshold: 2 }, ecdsaSigner);
