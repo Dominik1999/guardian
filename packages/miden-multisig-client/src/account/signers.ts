@@ -63,7 +63,7 @@ export type SignerSchemeErrorCode = 'signer_scheme_mismatch';
 
 /**
  * The acting signer's scheme differs from a scheme registered for the account's approvers or
- * its guardian.
+ * its guardian, or from the scheme given for a signer being added.
  *
  * Raised before a transaction that rewrites the approver set or the guardian (or registers the
  * account with GUARDIAN) is built, because building it under the acting signer's scheme would
@@ -81,7 +81,7 @@ export class SignerSchemeMismatchError extends Error {
     readonly guardian?: SignerSpec,
   ) {
     super(
-      `signer scheme '${signerScheme}' does not match the registered scheme of ` +
+      `signer scheme '${signerScheme}' does not match the scheme of ` +
         [
           ...mismatched.map((signer) => `${signer.commitment} ('${signer.scheme}')`),
           ...(guardian ? [`the guardian ${guardian.commitment} ('${guardian.scheme}')`] : []),

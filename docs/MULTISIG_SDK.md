@@ -716,7 +716,9 @@ use a scheme other than the acting signer's, with `SignerSchemeMismatchError`,
 until the server supports per-signer schemes (issue #563). Note that
 `signatureScheme` also sets the guardian's scheme: all-ECDSA `SignerSpec`s with
 it omitted build a Falcon guardian, which the guard then refuses to register
-under ECDSA. The Rust SDK still builds single-scheme accounts (issue #549).
+under ECDSA. `createAddSignerProposal` adds the new signer under the acting
+signer's scheme; a `SignerSpec` naming another scheme is refused the same way.
+The Rust SDK still builds single-scheme accounts (issue #549).
 
 ### Loading Existing Accounts
 
@@ -1294,7 +1296,7 @@ Authentication).
 | `importNoteFromFile(file)` | Import a note file from a browser `File`/`Blob` |
 | `recoverNotes(options?)` | Run the note-recovery strategies (transport drain, proposal import, public backfill) as one flow with a final verifying sync; returns a combined `NoteRecoveryReport` |
 | `preservePreSwitchProposalNotes()` | Pre-switch slice of the flow (issue #417): import notes embedded in the old GUARDIAN's pending proposals before repointing; run automatically by `executeProposal` on the switch path; returns the report or `undefined` |
-| `createAddSignerProposal(commitment, { nonce, newThreshold }?)` | Create add signer proposal (`newThreshold` defaults to the current threshold) |
+| `createAddSignerProposal(commitmentOrSignerSpec, { nonce, newThreshold }?)` | Create add signer proposal (`newThreshold` defaults to the current threshold). The new signer takes the acting signer's scheme; a `SignerSpec` with another scheme throws `SignerSchemeMismatchError` |
 | `createRemoveSignerProposal(commitment, { nonce, newThreshold }?)` | Create remove signer proposal (`newThreshold` defaults to min of current threshold and remaining signer count) |
 | `createChangeThresholdProposal(threshold, { nonce }?)` | Change the account-wide threshold (not a per-procedure override) |
 | `createUpdateProcedureThresholdProposal(procedure, threshold, { nonce }?)` | Create per-procedure threshold override proposal (`threshold: 0` clears the override) |

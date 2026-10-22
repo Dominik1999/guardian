@@ -310,6 +310,11 @@ guardian check matters even for a single-scheme approver set: all-ECDSA
 registering that account under ECDSA would have GUARDIAN sign acknowledgements
 the account verifies as Falcon.
 
+`createAddSignerProposal` adds the new signer under the acting signer's
+scheme. Pass a `SignerSpec` to state the new signer's scheme: one that differs
+from the acting signer's throws `SignerSchemeMismatchError` before the
+proposal is built.
+
 ### Register on GUARDIAN
 
 After creating the account, register it on the GUARDIAN server:
@@ -467,7 +472,7 @@ optional parameters:
 ```typescript
 createP2idProposal(recipientId, faucetId, amount, { nonce, noteType, reclaimHeight, timelockHeight }?)
 createConsumeNotesProposal(noteIds, { nonce }?)
-createAddSignerProposal(commitment, { nonce, newThreshold }?)
+createAddSignerProposal(commitmentOrSignerSpec, { nonce, newThreshold }?)
 createRemoveSignerProposal(commitment, { nonce, newThreshold }?)
 createChangeThresholdProposal(threshold, { nonce }?)
 createUpdateProcedureThresholdProposal(procedure, threshold, { nonce }?)

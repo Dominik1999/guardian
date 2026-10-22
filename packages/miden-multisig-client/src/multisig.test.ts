@@ -3741,7 +3741,7 @@ describe('Multisig', () => {
       );
 
       await expect(multisig.createChangeThresholdProposal(2)).rejects.toThrow(
-        /signer scheme 'falcon' does not match the registered scheme/,
+        /signer scheme 'falcon' does not match the scheme/,
       );
     });
   });
@@ -3850,6 +3850,43 @@ describe('Multisig', () => {
         [...config.signerCommitments, newCommitment],
         { accountId: expect.any(String), signatureScheme: mockSigner.scheme },
       );
+    });
+
+    it("add: takes a SignerSpec in the acting signer's scheme like a bare commitment", async () => {
+      mockPushResponse('add_signer');
+      const newCommitment = '0x' + 'e'.repeat(64);
+
+      const multisig = createTestMultisig(config);
+      await multisig.createAddSignerProposal(
+        { commitment: newCommitment, scheme: 'falcon' },
+        { nonce: 1, newThreshold: 3 },
+      );
+
+      expect(buildUpdateSignersTransactionRequest).toHaveBeenCalledWith(
+        mockWebClient,
+        3,
+        [...config.signerCommitments, newCommitment],
+        { accountId: expect.any(String), signatureScheme: 'falcon' },
+      );
+    });
+
+    it("add: refuses a SignerSpec whose scheme differs from the acting signer's before building", async () => {
+      const newCommitment = '0x' + 'e'.repeat(64);
+      const multisig = createTestMultisig(config);
+
+      const error = await multisig
+        .createAddSignerProposal({ commitment: newCommitment, scheme: 'ecdsa' }, { nonce: 1 })
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(SignerSchemeMismatchError);
+      expect(error).toMatchObject({
+        code: 'signer_scheme_mismatch',
+        signerScheme: 'falcon',
+        mismatched: [{ commitment: newCommitment, scheme: 'ecdsa' }],
+        guardian: undefined,
+      });
+      expect(buildUpdateSignersTransactionRequest).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('add: rejects the GUARDIAN commitment as a signer before collecting signatures', async () => {

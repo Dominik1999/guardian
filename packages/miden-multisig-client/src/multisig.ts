@@ -16,6 +16,7 @@ import type {
   ProposalSignatureEntry,
   ProposalType,
   SignatureScheme,
+  SignerInput,
   SignerSpec,
 } from './types.js';
 import { BoundBlockMismatchError, ProposalSaltMalformedError } from './multisig/authArgErrors.js';
@@ -662,6 +663,22 @@ export class Multisig {
     }
   }
 
+  /**
+   * The commitment of a signer being added. The update writes it under this
+   * signer's scheme, so a spec naming another scheme is refused rather than
+   * silently rewritten.
+   */
+  private newSignerCommitment(newSigner: SignerInput): string {
+    if (typeof newSigner === 'string') {
+      return newSigner;
+    }
+    const [spec] = resolveSignerSpecs({ signerCommitments: [newSigner] });
+    if (spec.scheme !== this.signer.scheme) {
+      throw new SignerSchemeMismatchError(this.signer.scheme, [spec]);
+    }
+    return newSigner.commitment;
+  }
+
   private warnOnOverrideDilution(newNumSigners: number): void {
     const current = this.signerCommitments.length;
     for (const { procedure, threshold } of this.overridesDilutedBySignerGrowth(newNumSigners)) {
@@ -1189,17 +1206,25 @@ export class Multisig {
   /**
    * Create an "add signer" proposal.
    *
-   * @param newCommitment - Commitment of the new signer (hex)
+   * The new signer takes this signer's scheme, which every current approver
+   * and the guardian already use (the proposal is refused otherwise). A
+   * {@link SignerSpec} states the new signer's scheme explicitly; one that
+   * differs from this signer's is refused with {@link SignerSchemeMismatchError}
+   * before anything is built, until GUARDIAN supports per-signer schemes
+   * (issue #563).
+   *
+   * @param newSigner - Commitment of the new signer (hex), or a {@link SignerSpec}
    * @param options - Optional settings: `nonce`, `newThreshold` (defaults to
    *   current threshold)
    */
   async createAddSignerProposal(
-    newCommitment: string,
+    newSigner: SignerInput,
     options: CreateSignerProposalOptions = {},
     ...legacyArgs: never[]
   ): Promise<Proposal> {
     assertProposalOptionsBag('createAddSignerProposal', options, legacyArgs);
     this.assertSignerSchemesMatch();
+    const newCommitment = this.newSignerCommitment(newSigner);
     const targetThreshold = options.newThreshold ?? this.threshold;
     const targetSignerCommitments = [...this.signerCommitments, newCommitment];
     // What `update_signers_and_threshold` rejects on-chain, and what the auth
