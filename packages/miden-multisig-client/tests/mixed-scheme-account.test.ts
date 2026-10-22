@@ -1,5 +1,6 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   Account,
@@ -44,20 +45,18 @@ interface MixedSchemeAccountFixture {
   guardian_scheme: SignatureScheme;
 }
 
-let cachedFixture: MixedSchemeAccountFixture | null = null;
+// `cargo run` compiles the example first when the target dir does not hold it yet: CI prebuilds
+// it, but a cold local run takes tens of seconds, far past the default per-test budget.
+const FIXTURE_BUILD_TIMEOUT_MS = 600_000;
 
-function loadFixture(): MixedSchemeAccountFixture {
-  if (cachedFixture) {
-    return cachedFixture;
-  }
+async function loadFixture(): Promise<MixedSchemeAccountFixture> {
   const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
-  const output = execFileSync(
+  const { stdout } = await promisify(execFile)(
     'cargo',
     ['run', '--quiet', '--example', 'mixed_scheme_account', '-p', 'miden-multisig-client'],
     { cwd: repoRoot, encoding: 'utf8' },
   );
-  cachedFixture = JSON.parse(output) as MixedSchemeAccountFixture;
-  return cachedFixture;
+  return JSON.parse(stdout) as MixedSchemeAccountFixture;
 }
 
 function fixtureConfig(fixture: MixedSchemeAccountFixture): MultisigConfig {
@@ -85,8 +84,13 @@ function buildAccount(config: MultisigConfig, seed: Uint8Array): Account {
  */
 describe('mixed-scheme approver sets', () => {
   describe('against a Rust-built mixed-scheme account', () => {
+    let fixture: MixedSchemeAccountFixture;
+
+    beforeAll(async () => {
+      fixture = await loadFixture();
+    }, FIXTURE_BUILD_TIMEOUT_MS);
+
     it('reads every approver scheme and the guardian scheme back', () => {
-      const fixture = loadFixture();
       const account = Account.deserialize(hexToBytes(fixture.account_hex));
 
       const detected = AccountInspector.fromAccount(account);
@@ -97,7 +101,6 @@ describe('mixed-scheme approver sets', () => {
     });
 
     it('writes the same code and storage as miden-standards for the same configuration', async () => {
-      const fixture = loadFixture();
       const rust = Account.deserialize(hexToBytes(fixture.account_hex));
       const client = await MidenClient.createMock();
       try {
