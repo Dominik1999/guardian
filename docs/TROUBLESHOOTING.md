@@ -395,7 +395,11 @@ its predecessor if the chain turns out to have landed.
 Recovery for the client: check the delta's status first — if it flipped
 to `canonical`, the transaction landed and there is nothing to redo.
 Otherwise `GET /delta/since` → replay canonical chain → rebuild the
-transaction → resubmit (this supersedes the retained row).
+transaction → resubmit. The resubmission supersedes the retained row,
+which moves to the `superseded_deltas` archive: if the original
+transaction lands after all, the reconcile pass still promotes it from
+there (within the retention TTL), and the resubmission's candidate is
+parked as diverged.
 
 An error log `Failed to replay the candidate queue onto the canonical
 state` (or `Candidate queue replay does not reproduce the stored tail
@@ -724,7 +728,7 @@ come from
 | `unsupported_for_network` | 400 | Endpoint not available for the account's network. |
 | `unsupported_evm_chain` | 400 | EVM chain ID not in the configured allowlist. |
 | `invalid_evm_proposal` | 400 | EVM proposal payload validation failed. |
-| `insufficient_signatures` | 400 | Threshold not met for a multi-sig execute. |
+| `insufficient_signatures` | 400 | Multisig threshold not met: an EVM execute, or a Miden `push_delta` whose matching proposal lacks verified cosigner signatures for the lowest threshold the account permits (its default threshold, or a lower override on one of its non-auth procedures). |
 
 ### Network and infrastructure
 

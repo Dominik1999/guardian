@@ -3,13 +3,13 @@
 ## Services overview
 
 - **configure_account**: creates a Miden account by validating the provided network configuration and auth policy, then storing account metadata and the initial state with its commitment and account nonce. Every entry in `auth.cosigner_commitments` must be a canonical commitment (`0x` plus 64 lowercase hex digits) and the list must be non-empty and duplicate-free. For MultisigGuardian accounts the list must exactly match the signer map extracted from `initial_state`, including the map's canonical (index) order — the stored list is the authorization source of truth for every later request, so any mismatch is rejected as `InvalidInput`. A new account is first claimed by inserting its metadata row only if none exists; the request's replay timestamp is then consumed before any state is written, for new and existing accounts alike. Of two concurrent first configurations exactly one creates the account and the other is judged as a reconfiguration of it, so a retry or replay of the same signed request is refused with `authentication_replay` before it writes; one from a different signer passes its own replay check and reconfigures the account it lost to. A storage failure after the claim leaves metadata without stored state: the account is not listed by lookup and is skipped by the release sweep, and a retry of the same account id finishes it as a first configuration, held to the new-account scheme policy and counted as a creation. EVM accounts are not configured through this service.
-- **push_delta**: verifies a Miden delta against the tail of the account's candidate queue (the canonical state when nothing is queued, always so at the default depth of one), computes the new state's commitment and account nonce, attaches an acknowledgement, and either enqueues it as a candidate (canonicalization enabled) or immediately applies it and marks it canonical (optimistic mode). EVM accounts do not support `push_delta` in v1.
+- **push_delta**: verifies a Miden delta against the tail of the account's candidate queue (the canonical state when nothing is queued, always so at the default depth of one), computes the new state's commitment and account nonce, attaches an acknowledgement, and either enqueues it as a candidate (canonicalization enabled) or immediately applies it and marks it canonical (optimistic mode). When the tail account is a multisig, the acknowledgement is refused with `insufficient_signatures` unless a matching pending proposal (the same transaction summary commitment) carries verified cosigner signatures from the account's approvers, counted once per key, at least as many as the lowest threshold the account permits for any transaction: the default threshold, or a lower override on one of the account's non-auth procedures. The chain skips the auth procedure and never calls a root the account does not export, so overrides on either are ignored. This floor is a denial-of-service guard, not the authorization rule. The chain requires the threshold of the procedures the transaction calls, which the summary does not show, so the gate never asks for more than the chain will and never refuses a transaction the chain would accept. A push that meets the floor but not the chain's requirement is acknowledged, refused on chain, and holds a candidate slot until canonicalization drops it; on an account with no per-procedure override below the default, that takes the default threshold of cosigners. The `proposal_type` label plays no part. A storage fault while loading that proposal refuses the push. The gate runs before the delta is verified or applied. Single-key accounts are unchanged. EVM accounts do not support `push_delta` in v1.
 - **get_state**: authenticates and returns the latest persisted account state.
 - **get_canonical_nonce**: authenticates and returns the account nonce and commitment stored with the latest persisted account state, without loading the state blob, so a client can skip `get_state` when that nonce is below its local nonce, or equal to it at the same commitment (issue #191). A state stored before nonces were kept is decoded once, and its nonce is backfilled onto the row only while the row still holds that state.
 - **get_delta**: authenticates and returns a specific delta by nonce.
 - **get_delta_since**: authenticates, fetches deltas after a given nonce (excluding discarded), merges their payloads via the network client, and returns a single merged delta snapshot.
 - **push_delta_proposal**: creates a pending Miden proposal by validating `tx_summary` against the tail of the account's candidate queue (the canonical state when nothing is queued) and deriving IDs through the Miden network client. It is refused with `409 conflict_pending_delta` when its delta could never be admitted: while the queue is full, when a queue exists and its nonce is not the newest queued candidate's plus one, or when the newest queued candidate changes the account's signer set or guardian key. The metadata is stored as sent apart from normalizing `proposal_type`, `description`, `amount` and `required_signatures`; client fields such as `bound_block_num` pass through unread.
-- **sign_delta_proposal**: appends one signer signature to a pending Miden proposal.
+- **sign_delta_proposal**: appends one signer signature to a pending Miden proposal. The append commits only if the proposal is unchanged since it was read, and otherwise is applied again to the current proposal, so concurrent signings never drop each other's approval (the multisig push gate counts the stored approvals).
 - **evm_session**: issues an EIP-712 wallet challenge, recovers the EOA with `ecrecover`, consumes the nonce once, and creates a cookie-backed session.
 - **evm_accounts**: registers EVM smart accounts under `/evm/accounts` by validating the cookie session signer, server-owned chain config, ERC-7579 validator installation, and signer snapshot before storing account metadata without state or acknowledgement data.
 - **evm_proposals**: creates, lists, approves, fetches executable data for, and cancels EVM proposals with opaque payloads, UserOperation hashes, signer snapshots, TTL, and lazy EntryPoint nonce cleanup.
@@ -87,6 +87,10 @@ sequenceDiagram
       S->>N: account_auth_binding(canonical_state), account_auth_binding(tail_state)
       alt the tail binds another signer set or guardian key
         S-->>C: 409 ConflictPendingDelta
+      end
+      S->>ST: pull_delta_proposal(account_id, summary commitment)
+      alt the tail account is a multisig and the matching proposal is missing,\nits verified approver signatures are below the lowest threshold\nthe account permits,\nor the proposal row cannot be loaded
+        S-->>C: 400 InsufficientSignatures, or 500 on a storage fault
       end
       S->>N: verify_and_apply_delta(tail_commitment, tail_state, payload)\n(one decode: new_state_json, new_commitment, new_nonce)
       alt a candidate is queued and new_nonce is not the delta's nonce
@@ -394,8 +398,9 @@ sequenceDiagram
   nonce rule and, at execution, the SDKs keep a proposal from executing
   anywhere but on the tail: both SDKs refuse to execute a proposal pinned
   to a state the client does not hold (TypeScript 0.18.0 and earlier
-  pushed the pinned base regardless; a switch proposal is checked while
-  the pre-switch GUARDIAN serves it), and both push the state they
+  pushed the pinned base regardless, and the Rust SDK through 0.18.3
+  executed on its own state without the check; a switch proposal is
+  checked while the pre-switch GUARDIAN serves it), and both push the state they
   executed on, which the delta gate refuses unless it is the tail. Only viable proposals (pinned to the tail with a nonce above the
   tail's) count toward the pending-proposal limit, which is checked before
   the tail replay. Promotion of the oldest candidate
@@ -518,16 +523,30 @@ sequenceDiagram
     promoted in order, base-first. Anything else waits for a later tick
     — the TTL is the only bound.
   - A new candidate submission at a retained or client-abandoned delta's
-    nonce supersedes (deletes) that row inside the submission
-    transaction — without the abandoned-row supersede, the resubmission
-    the abandon endpoint exists to enable would be refused forever at
-    the nonce's unique constraint. Deltas are unique per
-    `(account_id, nonce)` and admission requires chaining from the
-    account's queue tail (the canonical head when nothing is queued), so
-    same-nonce supersede is the only
-    replacement path; a retained row orphaned by an out-of-band base
-    move (e.g. `configure`) can never promote — the base gate rules it
-    out — and ages out through the TTL.
+    nonce supersedes that row inside the submission transaction —
+    without the supersede, the resubmission the abandon endpoint exists
+    to enable would be refused forever at the nonce's unique
+    constraint. Deltas are unique per `(account_id, nonce)` and
+    admission requires chaining from the account's queue tail (the
+    canonical head when nothing is queued), so same-nonce supersede is
+    the only replacement path. The superseded row is moved to the
+    `superseded_deltas` archive, not deleted (with retention disabled,
+    `retained_ttl_seconds = 0`, nothing is reconciled and it is
+    deleted): its transaction may still land, and the row is then the
+    only record of that step. The reconcile pass treats archived rows as
+    recoverable for the retention TTL, counted from the supersede, and
+    prunes older ones; accounts holding archived rows are visited even
+    when nothing else is recoverable. The recoverable-path walk backs
+    out of a hop that leads nowhere, because an archived row and the row
+    that replaced it share a nonce and a base and only the one that
+    landed reaches the chain. Promoting an archived row writes it back
+    as the canonical row at its nonce, in one locked, fenced write: only
+    while the row now at that nonce is retained or client-abandoned
+    (never over a candidate, which first diverges and is parked, or a
+    canonical row), archiving the replaced row in turn, and gated on the
+    stored state still sitting at its base. A retained row orphaned by
+    an out-of-band base move (e.g. `configure`) can never promote — the
+    base gate rules it out — and ages out through the TTL.
 
 - Release on guardian switch, push path (issue #305): when a delta
   commits (optimistic mode) or canonicalizes (candidate mode) and the
@@ -587,10 +606,13 @@ sequenceDiagram
 
 ### State Machine
 - candidate -> canonical | retained | discarded; retained -> canonical
-  (reconciled) | superseded (deleted by a new submission at its nonce) |
+  (reconciled) | superseded (archived by a new submission at its nonce) |
   dropped (TTL expiry); discarded{client_abandoned} -> canonical
   (late-landing reconcile, within the TTL) | superseded (new submission
-  at its nonce). Discarded deltas MUST NOT be returned by default APIs.
+  at its nonce); superseded -> canonical (late-landing reconcile, within
+  the TTL from the supersede, replacing a retained or client-abandoned
+  row at its nonce) | pruned (TTL expiry). Discarded and superseded
+  deltas MUST NOT be returned by default APIs.
 
 ### Failure Handling
 - Transient failures SHOULD be retried with backoff. Malformed candidates SHOULD be quarantined with logs/metrics.

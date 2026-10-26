@@ -183,6 +183,30 @@ EIP-712 digest derived from that commitment, so the digest displayed by the
 wallet need not equal the proposal ID. The approval signature and the
 Guardian request-authentication signature are separate.
 
+For a Miden Wallet, use `MidenWalletSigner`. Some Miden wallets expose only a
+32-byte key commitment, which does not reveal the signature scheme: the older
+Miden Wallet extension signs with Falcon and the Bread wallet with ECDSA.
+`PublicKeyFormat.parse` returns `scheme: null` for such an input, so the
+application must choose the scheme, for example by letting the user select
+it. Pass that scheme to the signer and omit `publicKey`:
+
+```typescript
+import { MidenWalletSigner, PublicKeyFormat } from '@openzeppelin/miden-multisig-client';
+
+const { scheme, publicKeyHex, commitment } = PublicKeyFormat.parse(walletPublicKey);
+const signer = scheme
+  ? new MidenWalletSigner(wallet, commitment!, scheme, undefined, publicKeyHex)
+  : new MidenWalletSigner(wallet, commitment!, selectedScheme);
+```
+
+Do not pass the commitment as `publicKey`: it is not a public key, and an
+ECDSA signer rejects it. Without a `publicKey`, an ECDSA signer recovers the
+key from the wallet's first signature. If the wallet signs with the other
+scheme, the signer throws before contacting Guardian, naming the scheme to
+select (for example `select falcon`). Through 0.18.3, `PublicKeyFormat.parse`
+labelled every 32-byte input `falcon`; callers that read its `scheme` must now
+handle `null`.
+
 The nested `prover` configuration is optional. Without it, the injected Miden
 client's prover is preserved. By default, cloneable remote provers get two total
 attempts; endpoint-less injected provers, including local and callback provers,
@@ -462,6 +486,13 @@ account afterwards. Call `fetchState()` when you need GUARDIAN's state copy
 regardless. The pre-check needs a GUARDIAN server that serves `GET /state/nonce`
 (issue #191); against an older server `syncState()` fails rather than falling back
 to the full fetch, so deploy the server first.
+
+`multisig.threshold` and `multisig.signerCommitments` are a cache of the local
+store. Every call that decides from them (creating, signing, importing, listing,
+submitting and executing proposals, registration) re-reads the store first, after its own
+chain sync when it makes one, since an execution or a chain sync that undoes a
+dropped transaction can change the signer set under the cache. A store record
+whose config cannot be read in full makes the call throw instead.
 
 ### Creating Proposals
 

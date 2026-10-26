@@ -270,6 +270,32 @@ impl StorageBackend for EncryptedStorage {
             .collect()
     }
 
+    async fn pull_superseded_deltas(
+        &self,
+        account_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::storage::SupersededDelta>, String> {
+        self.inner
+            .pull_superseded_deltas(account_id, since)
+            .await?
+            .into_iter()
+            .map(|archived| {
+                Ok(crate::storage::SupersededDelta {
+                    delta: self.decrypt_delta(archived.delta)?,
+                    superseded_at: archived.superseded_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn prune_superseded_deltas(
+        &self,
+        account_id: &str,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        self.inner.prune_superseded_deltas(account_id, before).await
+    }
+
     async fn list_accounts_with_recoverable_deltas(
         &self,
         abandoned_since: chrono::DateTime<chrono::Utc>,
@@ -323,6 +349,21 @@ impl StorageBackend for EncryptedStorage {
             .await
     }
 
+    async fn update_delta_proposal_if_status(
+        &self,
+        commitment: &str,
+        proposal: &DeltaObject,
+        expected: &DeltaStatus,
+    ) -> Result<bool, String> {
+        self.inner
+            .update_delta_proposal_if_status(
+                commitment,
+                &self.encrypt_proposal(commitment, proposal)?,
+                expected,
+            )
+            .await
+    }
+
     async fn delete_delta_proposal(
         &self,
         account_id: &str,
@@ -364,15 +405,10 @@ impl StorageBackend for EncryptedStorage {
         metadata: &dyn crate::metadata::MetadataStore,
         delta: &DeltaObject,
         now: &str,
-        max_pending_candidates: usize,
+        policy: crate::storage::CandidatePolicy,
     ) -> Result<CandidateSubmission, String> {
         self.inner
-            .submit_candidate(
-                metadata,
-                &self.encrypt_delta(delta)?,
-                now,
-                max_pending_candidates,
-            )
+            .submit_candidate(metadata, &self.encrypt_delta(delta)?, now, policy)
             .await
     }
 

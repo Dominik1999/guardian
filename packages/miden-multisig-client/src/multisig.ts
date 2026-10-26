@@ -293,6 +293,31 @@ function approvalExpirationDeltaOf(
   return delta;
 }
 
+/**
+ * Refuses a relay whose response stores the relayed approval under another
+ * signer. A server before 0.18.1 credits every approval to the request
+ * signer, and other devices that load such an entry would execute with it.
+ */
+function assertApprovalCreditedToItsSigner(stored: DeltaObject, relayed: ProposalSignatureEntry): void {
+  if (stored.status.status !== 'pending') {
+    return;
+  }
+  const bare = (hex: string) => hex.replace(/^0x/i, '').toLowerCase();
+  const signature = bare(relayed.signature.signature);
+  const misattributed = stored.status.cosignerSigs.find(
+    (sig) =>
+      bare(sig.signature.signature) === signature &&
+      normalizeHexWord(sig.signerId) !== normalizeHexWord(relayed.signerId),
+  );
+  if (misattributed) {
+    throw new Error(
+      `GUARDIAN stored the relayed approval of ${relayed.signerId} as ${misattributed.signerId}; ` +
+        'it does not verify relayed approvals (a server before 0.18.1). Upgrade the server ' +
+        'before executing this proposal',
+    );
+  }
+}
+
 function summarySaltHex(summary: TransactionSummary): string {
   const salt = summarySalt(summary);
   try {
@@ -331,6 +356,29 @@ const MAX_BLOCK_NUM = 0xffff_ffff;
  * orphaned by a GUARDIAN repoint) before the sync prunes it.
  */
 const UNREPORTED_LISTING_MISS_LIMIT = 2;
+
+/**
+ * Refuses to execute a proposal GUARDIAN pinned to a state other than the one
+ * this client holds; returns the local commitment it executes on. The
+ * transaction executes on this client's own record of the account while the
+ * execution push names the pinned base, so the two have to be the same state.
+ * A proposal pinned to a state the account has since left was made for that
+ * state, and its transaction would otherwise run again on the current one.
+ * One pinned to a state this client does not hold (a server that queues
+ * chained candidates pins a proposal to the newest queued candidate's
+ * post-state) would be admitted behind that candidate while the transaction
+ * itself lands on the older state, leaving GUARDIAN behind the chain.
+ */
+function assertExecutesOnPinnedBase(proposalId: string, localCommitment: string, pinnedBase: string): string {
+  const pinned = normalizeHexWord(pinnedBase);
+  if (localCommitment !== pinned) {
+    throw new Error(
+      `Proposal ${proposalId} was made for account state ${pinned}, but this client's account is at ${localCommitment}: ` +
+        'sync the account (syncState) and retry, or create a new proposal if the account has moved past that state',
+    );
+  }
+  return localCommitment;
+}
 
 export class Multisig {
   account: Account;
@@ -494,35 +542,6 @@ export class Multisig {
   }
 
   /**
-   * Refuses to execute a proposal GUARDIAN pinned to a state other than the
-   * one this client holds. The transaction executes on this client's own
-   * record of the account while the execution push names the pinned base,
-   * so the two have to be the same state. A proposal pinned to a state the
-   * account has since left was made for that state, and its transaction
-   * would otherwise run again on the current one. One pinned to a state this
-   * client does not hold (a server that queues chained candidates pins a
-   * proposal to the newest queued candidate's post-state) would be admitted
-   * behind that candidate while the transaction itself lands on the older
-   * state, leaving GUARDIAN behind the chain.
-   */
-  private async assertExecutesOnPinnedBase(proposalId: string, pinnedBase: string): Promise<string> {
-    const local = await this.localAccountCommitment();
-    const pinned = normalizeHexWord(pinnedBase);
-    if (local !== pinned) {
-      throw new Error(
-        `Proposal ${proposalId} was made for account state ${pinned}, but this client's account is at ${local}: ` +
-          'sync the account (syncState) and retry, or create a new proposal if the account has moved past that state',
-      );
-    }
-    return local;
-  }
-
-  /** The commitment of this client's record of the account. */
-  private async localAccountCommitment(): Promise<string> {
-    return normalizeHexWord((await this.getStoreAccount()).to_commitment().toHex());
-  }
-
-  /**
    * Read the current ordered signer public-key commitments from account
    * storage (store-backed state, falling back to the snapshot).
    *
@@ -573,13 +592,18 @@ export class Multisig {
   /**
    * Get the effective threshold for a given proposal type.
    * Returns the procedure-specific threshold if configured, otherwise the default threshold.
+   * A P2ID transfer calls both `send_asset` and `create_note`, and the chain requires the
+   * higher of their thresholds.
    *
    * @param proposalType - The type of proposal
    * @returns The threshold that applies to this proposal type
    */
   getEffectiveThreshold(proposalType: ProposalType): number {
-    if (this.procedureThresholds.size === 0) {
-      return this.threshold;
+    if (proposalType === 'p2id') {
+      return Math.max(
+        this.getProcedureThreshold('send_asset'),
+        this.getProcedureThreshold('create_note'),
+      );
     }
 
     const procedure = this.getProposalProcedure(proposalType);
@@ -587,6 +611,10 @@ export class Multisig {
       return this.threshold;
     }
 
+    return this.getProcedureThreshold(procedure);
+  }
+
+  private getProcedureThreshold(procedure: ProcedureName): number {
     return this.procedureThresholds.get(procedure) ?? this.threshold;
   }
 
@@ -891,27 +919,55 @@ export class Multisig {
     return account;
   }
 
+  /**
+   * Re-read the signer config from the local store after a step that can
+   * change the store under the cache: an execution applying its post-state,
+   * or a chain sync in which miden-client undoes a dropped transaction.
+   * `syncState` refreshes on its own. Without this the cache keeps a signer
+   * set the store no longer has, and readiness, membership targets and
+   * registration read it. Called right before a decision, so a store record
+   * whose config cannot be read in full throws rather than leave the decision
+   * on the cache. With no store record the cache, last read from the store or
+   * the loaded snapshot, is kept.
+   */
+  private async refreshConfigFromStore(): Promise<void> {
+    const account = await this.readStoreAccount();
+    if (account) {
+      this.adoptConfigFromAccount(account);
+    }
+  }
+
+  /**
+   * Refresh the cache from `account` where a stale cache is tolerable (a
+   * sync): an unreadable config warns and keeps the previously validated one.
+   */
   private refreshConfigFromAccount(account: Account | null): void {
     if (!account) {
       return;
     }
 
     try {
-      const detected = AccountInspector.fromAccount(account);
-      // Fail closed on a partial read: adopting a truncated signer set would
-      // let membership proposals rewrite the account without the omitted
-      // keys. The catch below keeps the previously validated config instead.
-      assertCompleteDetectedConfig(detected);
-      this.account = account;
-      this.threshold = detected.threshold;
-      this.signerCommitments = detected.signerCommitments;
-      this.signers = detected.signers;
-      this.guardianCommitment = detected.guardianCommitment;
-      this.guardianScheme = detected.guardianScheme;
-      this.procedureThresholds = new Map(detected.procedureThresholds);
+      this.adoptConfigFromAccount(account);
     } catch (error) {
       console.warn('Failed to refresh multisig config from account state', error);
     }
+  }
+
+  /**
+   * Replace the cached config with `account`'s. Throws on a partial read:
+   * adopting a truncated signer set would let membership proposals rewrite
+   * the account without the omitted keys.
+   */
+  private adoptConfigFromAccount(account: Account): void {
+    const detected = AccountInspector.fromAccount(account);
+    assertCompleteDetectedConfig(detected);
+    this.account = account;
+    this.threshold = detected.threshold;
+    this.signerCommitments = detected.signerCommitments;
+    this.signers = detected.signers;
+    this.guardianCommitment = detected.guardianCommitment;
+    this.guardianScheme = detected.guardianScheme;
+    this.procedureThresholds = new Map(detected.procedureThresholds);
   }
 
   /**
@@ -923,6 +979,7 @@ export class Multisig {
    * @param initialStateBase64 - Optional base64-encoded serialized Account.¡
    */
   async registerOnGuardian(initialStateBase64?: string): Promise<void> {
+    await this.refreshConfigFromStore();
     this.assertSignerSchemesMatch();
     // Serialize the account to bytes and base64-encode
     const stateData =
@@ -1013,7 +1070,6 @@ export class Multisig {
     const generation = this.syncGeneration;
     const candidates = new Map(this.proposals);
     const deltas = await this.guardian.getDeltaProposals(this._accountId);
-    const factory = this.proposalFactory();
 
     const reported = new Map<string, { delta: (typeof deltas)[number]; verified: Proposal }>();
     if (deltas.length > 0) {
@@ -1023,7 +1079,9 @@ export class Multisig {
       await this.syncChain().catch((error) =>
         console.warn('Could not sync the Miden client before verifying proposals', error),
       );
+      await this.refreshConfigFromStore();
     }
+    const factory = this.proposalFactory();
     for (const delta of deltas) {
       const proposalId = normalizeHexWord(
         computeCommitmentFromTxSummary(delta.deltaPayload.txSummary.data)
@@ -1045,12 +1103,15 @@ export class Multisig {
       reported.set(proposal.id, { delta, verified: proposal });
     }
 
+    if (reported.size > 0) {
+      await this.refreshConfigFromStore();
+    }
     if (generation !== this.syncGeneration) {
       throw new Error(
         'Sync aborted: the GUARDIAN client was replaced while the sync was in flight'
       );
     }
-
+    const settled = this.proposalFactory();
     const applied: Proposal[] = [];
     for (const { delta, verified } of reported.values()) {
       const current = this.proposals.get(verified.id);
@@ -1058,14 +1119,10 @@ export class Multisig {
         applied.push(current);
         continue;
       }
-      applied.push(
-        current === undefined
-          ? verified
-          : {
-              ...factory.fromDelta(delta, verified.id, verified.metadata, current.signatures),
-              verification: verified.verification,
-            }
-      );
+      applied.push({
+        ...settled.fromDelta(delta, verified.id, verified.metadata, current?.signatures ?? []),
+        verification: verified.verification,
+      });
     }
     for (const proposal of applied) {
       this.proposals.set(proposal.id, proposal);
@@ -1183,6 +1240,19 @@ export class Multisig {
    * @param metadata - Optional metadata for execution (target config, salt, etc.)
    */
   async createProposal(nonce: number, txSummaryBase64: string, metadata: ProposalMetadata): Promise<Proposal> {
+    await this.refreshConfigFromStore();
+    return this.pushProposal(nonce, txSummaryBase64, metadata);
+  }
+
+  /**
+   * Push a proposal to GUARDIAN and parse the reply against the signer config
+   * the caller refreshed from the store.
+   */
+  private async pushProposal(
+    nonce: number,
+    txSummaryBase64: string,
+    metadata: ProposalMetadata,
+  ): Promise<Proposal> {
     const guardianMetadata = ProposalMetadataCodec.toGuardian(metadata);
 
     const response = await this.guardian.pushDeltaProposal({
@@ -1222,6 +1292,7 @@ export class Multisig {
     options: CreateSignerProposalOptions = {},
     ...legacyArgs: never[]
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createAddSignerProposal', options, legacyArgs);
     this.assertSignerSchemesMatch();
     const newCommitment = this.newSignerCommitment(newSigner);
@@ -1257,7 +1328,7 @@ export class Multisig {
       description: `Add signer ${newCommitment.slice(0, 10)}...`,
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -1272,6 +1343,7 @@ export class Multisig {
     options: CreateSignerProposalOptions = {},
     ...legacyArgs: never[]
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createRemoveSignerProposal', options, legacyArgs);
     this.assertSignerSchemesMatch();
     const normalizedRemove = signerToRemove.toLowerCase();
@@ -1314,7 +1386,7 @@ export class Multisig {
       description: `Remove signer ${signerToRemove.slice(0, 10)}...`,
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -1327,6 +1399,7 @@ export class Multisig {
     newThreshold: number,
     options: CreateProposalOptions = {},
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createChangeThresholdProposal', options);
     this.assertSignerSchemesMatch();
     if (newThreshold < 1 || newThreshold > this.signerCommitments.length) {
@@ -1359,7 +1432,7 @@ export class Multisig {
       description: `Change threshold from ${this.threshold} to ${newThreshold}`,
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   async createUpdateProcedureThresholdProposal(
@@ -1367,6 +1440,7 @@ export class Multisig {
     targetThreshold: number,
     options: CreateProposalOptions = {},
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createUpdateProcedureThresholdProposal', options);
     if (targetThreshold < 0 || targetThreshold > this.signerCommitments.length) {
       throw new Error(
@@ -1408,7 +1482,7 @@ export class Multisig {
       description: action,
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -1424,6 +1498,7 @@ export class Multisig {
     options: CreateProposalOptions = {},
   ): Promise<Proposal> {
     assertProposalOptionsBag('createSwitchGuardianProposal', options);
+    await this.refreshConfigFromStore();
     // The rotation writes this signer's scheme into the guardian slot and asks
     // the new endpoint for a key of that scheme.
     this.assertSignerSchemesMatch();
@@ -1437,7 +1512,7 @@ export class Multisig {
     // sign/execute (which fetch from GUARDIAN) can find it. To leave an
     // unreachable GUARDIAN, use createSwitchGuardianProposalOffline instead.
     const proposalNonce = await this.resolveProposalNonce('createSwitchGuardianProposal', options);
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -1584,6 +1659,7 @@ export class Multisig {
     // proposal signs must be the one every cosigner's rebuild reproduces, so
     // the notes are authenticated here first, before the summary is derived.
     await this.ensureNotesAuthenticated(fetchedNotes);
+    await this.refreshConfigFromStore();
     const proposalNonce = await this.resolveProposalNonce('createConsumeNotesProposal', options);
     const embeddedNotes = fetchedNotes.map((n) => noteToBase64(n));
 
@@ -1616,7 +1692,7 @@ export class Multisig {
       throw new ConsumeNotesMetadataOversizeError(MAX_CONSUME_NOTES_METADATA_BYTES, metadataSize);
     }
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -1636,6 +1712,7 @@ export class Multisig {
     options: CreateP2idProposalOptions = {},
     ...legacyArgs: never[]
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createP2idProposal', options, legacyArgs);
     if (amount <= 0n) {
       throw new Error('Amount must be greater than 0');
@@ -1672,7 +1749,7 @@ export class Multisig {
       description: `Send ${amount} of asset ${faucetId.slice(0, 10)}... to ${recipientId.slice(0, 10)}...`,
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -2129,15 +2206,17 @@ export class Multisig {
     const normalizedProposalId = normalizeHexWord(proposalId);
     // Verification re-executes the proposal at the store's sync height.
     await this.syncChain();
+    await this.refreshConfigFromStore();
     const existingProposal = await this.getProposalForSigning(proposalId, normalizedProposalId);
     if (!existingProposal) {
       throw new Error(`Proposal not found: ${proposalId}`);
     }
     this.proposalFactory().assertAccountId(existingProposal.accountId);
-    const factory = this.proposalFactory();
     const proposal = existingProposal;
 
     const commitmentToSign = await this.verifyProposalMetadataBinding(proposal);
+    await this.refreshConfigFromStore();
+    const factory = this.proposalFactory();
     const signature: ProposalSignature = await buildGuardianSignatureFromSigner(
       this.signer,
       commitmentToSign,
@@ -2156,11 +2235,21 @@ export class Multisig {
       proposal.signatures,
     );
     await this.verifyProposalMetadataBinding(signedProposal);
+    await this.refreshConfigFromStore();
+    const settled = {
+      ...this.proposalFactory().fromDelta(
+        signedDelta,
+        normalizedProposalId,
+        proposal.metadata,
+        proposal.signatures,
+      ),
+      verification: signedProposal.verification,
+    };
 
-    this.proposals.set(signedProposal.id, signedProposal);
-    this.guardianKnownProposalIds.add(signedProposal.id);
+    this.proposals.set(settled.id, settled);
+    this.guardianKnownProposalIds.add(settled.id);
 
-    return signedProposal;
+    return settled;
   }
 
   private async getProposalForSigning(
@@ -2193,7 +2282,7 @@ export class Multisig {
    * @param proposalId - The proposal commitment/ID
    */
   async executeProposal(proposalId: string): Promise<void> {
-    const { metadata, finalRequest, proposal, executedBase } =
+    const { metadata, finalRequest, proposal, executedBase, servedSwitch, approvals } =
       await this.prepareProposalExecution(proposalId);
 
     if (metadata.proposalType === 'switch_guardian') {
@@ -2217,7 +2306,24 @@ export class Multisig {
       // Best-effort: an unreachable old GUARDIAN must not block the switch, so
       // errors are swallowed (mirrors the Rust execute path, which names the
       // state it executed on and sends the summary it holds; GUARDIAN assigns
-      // the status).
+      // the status). The pre-switch GUARDIAN acknowledges the delta only when
+      // its stored proposal carries a threshold of approvals (issue #524), so
+      // approvals collected off channel are relayed to it first. A switch it
+      // never stored (one created offline) cannot be relayed to, so that
+      // GUARDIAN refuses the push and releases the account through its
+      // release sweep instead. A failed relay still leaves the push to be
+      // tried: the stored proposal may already carry a threshold.
+      if (servedSwitch) {
+        try {
+          await this.relayCollectedApprovals(normalizeHexWord(proposal.id), approvals, servedSwitch);
+        } catch (error) {
+          console.warn(
+            'Relaying collected approvals to the pre-switch GUARDIAN failed; pushing the ' +
+              'switch delta with the approvals it already holds',
+            error,
+          );
+        }
+      }
       try {
         await this.guardian.pushDelta({
           accountId: this._accountId,
@@ -2272,6 +2378,7 @@ export class Multisig {
   async submitTransaction(proposalId: string, request: TransactionRequest): Promise<void> {
     const normalizedProposalId = normalizeHexWord(proposalId);
     await this.syncChain();
+    await this.refreshConfigFromStore();
     const delta = await this.guardian.getDeltaProposal(this._accountId, normalizedProposalId);
     const existing = this.getLocalProposal(proposalId);
     // Parsed for its id check: a proposal GUARDIAN does not serve, or whose id
@@ -2326,6 +2433,7 @@ export class Multisig {
     proposalType: string,
     options: CreateProposalOptions = {},
   ): Promise<Proposal> {
+    await this.refreshConfigFromStore();
     assertProposalOptionsBag('createCustomProposal', options);
     const label = proposalType.trim().toLowerCase();
     if (label.length === 0) {
@@ -2354,7 +2462,7 @@ export class Multisig {
       requiredSignatures: this.getEffectiveThreshold('custom'),
     };
 
-    return this.createProposal(proposalNonce, summaryBase64, metadata);
+    return this.pushProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -2374,6 +2482,9 @@ export class Multisig {
     const normalizedProposalId = normalizeHexWord(proposalId);
     // The binding probe re-executes the producer's request at the store's sync height.
     await this.syncChain();
+    const storeAccount = await this.getStoreAccount();
+    this.adoptConfigFromAccount(storeAccount);
+    const localCommitment = normalizeHexWord(storeAccount.to_commitment().toHex());
     const delta = await this.guardian.getDeltaProposal(this._accountId, normalizedProposalId);
     const existing = this.getLocalProposal(proposalId);
     const proposal = this.proposalFactory().fromDelta(
@@ -2400,7 +2511,7 @@ export class Multisig {
         `Proposal is not ready for execution: have ${signaturesForExecution.length} of ${effectiveThreshold} required signatures.`,
       );
     }
-    await this.assertExecutesOnPinnedBase(proposalId, delta.prevCommitment);
+    assertExecutesOnPinnedBase(proposalId, localCommitment, delta.prevCommitment);
 
     const txSummary = TransactionSummary.deserialize(
       base64ToUint8Array(delta.deltaPayload.txSummary.data),
@@ -2503,6 +2614,7 @@ export class Multisig {
       adviceMap.insert(key, new FeltArray(values));
     }
 
+    await this.relayCollectedApprovals(normalizeHexWord(proposalId), signaturesForExecution, delta);
     const executionDelta = { ...delta, deltaPayload: delta.deltaPayload.txSummary };
     const pushResult = await this.guardian.pushDelta(executionDelta);
     const ackSigHex = pushResult.ackSig;
@@ -2550,6 +2662,69 @@ export class Multisig {
   }
 
   /**
+   * Relay locally collected approvals (signatures imported from an exported
+   * proposal document and verified into this client's cache) to GUARDIAN's
+   * stored proposal. GUARDIAN acknowledges a multisig delta only when its
+   * stored proposal carries a threshold of verified approvals (issue #524),
+   * and off-channel approvals exist only in the document, so each one the
+   * server does not yet hold is relayed through the signing endpoint before
+   * the acknowledgement push. The endpoint credits an approval to the
+   * cosigner its signature cryptographically verifies for, so any configured
+   * signer may relay; an approval GUARDIAN already holds answers
+   * `proposal_already_signed` and is skipped. A refusal with
+   * `invalid_proposal_signature` is skipped too: a server without the gate
+   * accepts only the caller's own approval and acknowledges the push without
+   * the rest, and a server with it does not count the refused approval, so
+   * the push itself reports a missing threshold.
+   */
+  private async relayCollectedApprovals(
+    proposalId: string,
+    signatures: ProposalSignatureEntry[],
+    delta: DeltaObject,
+  ): Promise<void> {
+    const alreadyHeld = new Set(
+      delta.status.status === 'pending'
+        ? delta.status.cosignerSigs.map((sig) => normalizeHexWord(sig.signerId))
+        : [],
+    );
+    // The caller's own approval goes first: a server that credits every
+    // approval to the request signer (before 0.18.1) then refuses the rest
+    // as already signed instead of storing them under the caller.
+    const caller = normalizeHexWord(this.signer.commitment);
+    const ordered = [
+      ...signatures.filter((entry) => normalizeHexWord(entry.signerId) === caller),
+      ...signatures.filter((entry) => normalizeHexWord(entry.signerId) !== caller),
+    ];
+    for (const entry of ordered) {
+      if (alreadyHeld.has(normalizeHexWord(entry.signerId))) {
+        continue;
+      }
+      try {
+        const stored = await this.guardian.signDeltaProposal({
+          accountId: this._accountId,
+          commitment: proposalId,
+          signature: entry.signature,
+        });
+        assertApprovalCreditedToItsSigner(stored, entry);
+      } catch (error) {
+        if (error instanceof GuardianHttpError && error.code === 'proposal_already_signed') {
+          continue;
+        }
+        if (error instanceof GuardianHttpError && error.code === 'invalid_proposal_signature') {
+          console.warn(
+            `GUARDIAN refused the relayed approval of ${entry.signerId}; a server without the ` +
+              'multisig push gate accepts only your own approval, otherwise the push reports ' +
+              'a missing threshold',
+            error,
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /**
    * The returned request declares the block the signed summary binds, and
    * executes at the chain tip.
    */
@@ -2559,6 +2734,13 @@ export class Multisig {
     proposal: Proposal;
     /** The account state the request was built on: this client's record. */
     executedBase: string;
+    /**
+     * A switch_guardian proposal as the pre-switch GUARDIAN serves it, or
+     * `undefined` for another type or when that GUARDIAN does not serve it.
+     */
+    servedSwitch: DeltaObject | undefined;
+    /** The verified approvals the request carries. */
+    approvals: ProposalSignatureEntry[];
   }> {
     const proposal = this.getLocalProposal(proposalId);
     if (!proposal) {
@@ -2569,6 +2751,9 @@ export class Multisig {
     // Verification and execution run at the store's sync height.
     await this.syncChain();
     await this.verifyProposalMetadataBinding(proposal);
+    const storeAccount = await this.getStoreAccount();
+    this.adoptConfigFromAccount(storeAccount);
+    const localCommitment = normalizeHexWord(storeAccount.to_commitment().toHex());
 
     const metadata = proposal.metadata;
     // Reject custom proposals before any advice assembly or GUARDIAN ack push:
@@ -2606,8 +2791,8 @@ export class Multisig {
       txSummaryBase64 = delta.deltaPayload.txSummary.data;
     }
     const executedBase = delta
-      ? await this.assertExecutesOnPinnedBase(proposalId, delta.prevCommitment)
-      : await this.localAccountCommitment();
+      ? assertExecutesOnPinnedBase(proposalId, localCommitment, delta.prevCommitment)
+      : localCommitment;
 
     const txSummaryBytes = base64ToUint8Array(txSummaryBase64);
     const txSummary = TransactionSummary.deserialize(txSummaryBytes);
@@ -2675,6 +2860,7 @@ export class Multisig {
     }
 
     if (!isSwitchGuardian && delta) {
+      await this.relayCollectedApprovals(normalizedProposalId, signaturesForExecution, delta);
       const executionDelta = {
         ...delta,
         deltaPayload: delta.deltaPayload.txSummary,
@@ -2733,7 +2919,14 @@ export class Multisig {
       binding,
       adviceMap,
     );
-    return { finalRequest, metadata, proposal, executedBase };
+    return {
+      finalRequest,
+      metadata,
+      proposal,
+      executedBase,
+      servedSwitch: isSwitchGuardian ? delta : undefined,
+      approvals: signaturesForExecution,
+    };
   }
 
   /**
@@ -2844,13 +3037,18 @@ export class Multisig {
       throw new Error('Invalid proposal JSON: missing required fields');
     }
 
-    const proposal = this.proposalFactory().fromExported(exported);
-
     // Verification re-executes every built-in type at the store's sync height.
-    if (proposal.metadata.proposalType !== 'custom') {
+    if (exported.metadata.proposalType !== 'custom') {
       await this.syncChain();
     }
-    await this.verifyProposalMetadataBinding(proposal);
+    await this.refreshConfigFromStore();
+    const verified = this.proposalFactory().fromExported(exported);
+    await this.verifyProposalMetadataBinding(verified);
+    await this.refreshConfigFromStore();
+    const proposal = {
+      ...this.proposalFactory().fromExported(exported),
+      verification: verified.verification,
+    };
     this.proposals.set(proposal.id, proposal);
 
     return proposal;
@@ -2869,6 +3067,12 @@ export class Multisig {
       throw new Error(`Proposal not found: ${proposalId}`);
     }
     this.proposalFactory().assertAccountId(proposal.accountId);
+    // Verification re-executes every built-in type at the store's sync height.
+    if (proposal.metadata?.proposalType !== 'custom') {
+      await this.syncChain();
+    }
+    const commitmentToSign = await this.verifyProposalMetadataBinding(proposal);
+    await this.refreshConfigFromStore();
 
     const localSignatureContext = `Invalid local proposal signatures for ${proposalId}`;
     const existingSignatures = new ProposalSignatures(
@@ -2889,12 +3093,6 @@ export class Multisig {
     if (alreadySigned) {
       throw new Error('You have already signed this proposal');
     }
-
-    // Verification re-executes every built-in type at the store's sync height.
-    if (proposal.metadata?.proposalType !== 'custom') {
-      await this.syncChain();
-    }
-    const commitmentToSign = await this.verifyProposalMetadataBinding(proposal);
 
     // Sign the commitment
     const signature = await buildGuardianSignatureFromSigner(this.signer, commitmentToSign);
